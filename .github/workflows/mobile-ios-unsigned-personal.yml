@@ -118,8 +118,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          entitlements="ios/T3Code/T3Code.entitlements"
-          if [[ ! -f "$entitlements" ]]; then
+          entitlements="$(find ios -maxdepth 2 -name '*.entitlements' | head -1)"
+          if [[ -z "$entitlements" ]]; then
             echo "No main-app entitlements file was generated."
             exit 0
           fi
@@ -139,10 +139,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          workspace="$(find ios -maxdepth 1 -name '*.xcworkspace' ! -name 'Pods*' | head -1)"
+          if [[ -z "$workspace" ]]; then
+            echo "No generated xcworkspace found under ios/." >&2
+            exit 1
+          fi
+          scheme="$(basename "$workspace" .xcworkspace)"
+          echo "Building workspace '$workspace' with scheme '$scheme'"
+
           derived_data="$RUNNER_TEMP/t3-ios-derived-data"
           xcodebuild \
-            -workspace ios/T3Code.xcworkspace \
-            -scheme T3Code \
+            -workspace "$workspace" \
+            -scheme "$scheme" \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -153,7 +161,7 @@ jobs:
             DEVELOPMENT_TEAM= \
             build
 
-          app_path="$derived_data/Build/Products/Release-iphoneos/T3Code.app"
+          app_path="$derived_data/Build/Products/Release-iphoneos/$scheme.app"
           if [[ ! -d "$app_path" ]]; then
             echo "Expected app bundle was not produced at $app_path" >&2
             exit 1
@@ -186,7 +194,7 @@ jobs:
           ipa_path="$output_dir/T3-Code-Preview-V2-unsigned.ipa"
 
           mkdir -p "$output_dir" "$payload_dir"
-          ditto "$APP_PATH" "$payload_dir/T3Code.app"
+          ditto "$APP_PATH" "$payload_dir/$(basename "$APP_PATH")"
           (
             cd "$(dirname "$payload_dir")"
             ditto -c -k --sequesterRsrc --keepParent Payload "$ipa_path"
