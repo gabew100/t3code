@@ -132,6 +132,51 @@ Create a persistent preview build:
 vp run eas:ios:preview
 ```
 
+### Personal iOS preview build
+
+The upstream preview profile is linked to T3's Expo project and Apple team. For a personal
+sideloadable preview, use the `preview:personal` profile with your own Expo project and bundle
+identifier. It keeps the `T3 Code Preview` app name, `t3code-preview` scheme, and preview runtime,
+but uses the existing reduced-capability iOS path: no widget/share extensions, push entitlement,
+native Sign in with Apple entitlement, or T3 associated-domain entitlement.
+
+Set these public values while bootstrapping and then in your own EAS `preview` environment:
+
+```text
+T3CODE_PERSONAL_EAS=1
+T3CODE_EAS_OWNER=<your Expo account>
+T3CODE_EAS_PROJECT_ID=<your EAS project UUID>
+T3CODE_IOS_PERSONAL_TEAM=1
+T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID=com.example.t3code.preview
+```
+
+For T3 Connect against the production deployment, use the public
+`T3CODE_CLERK_PUBLISHABLE_KEY`, `T3CODE_CLERK_JWT_TEMPLATE`, and `T3CODE_RELAY_URL` values from
+the repository-root `.env.example`.
+
+Create/link the personal EAS project before the first build, then run:
+
+```bash
+vp run eas:ios:preview:personal
+```
+
+### Unsigned personal iOS IPA without EAS
+
+If you do not have an Expo account or Apple Developer signing credentials, the repository also
+contains `.github/workflows/mobile-ios-unsigned-personal.yml`. Run **Personal iOS Unsigned IPA**
+manually from GitHub Actions. The workflow uses GitHub's macOS runner to generate the native iOS
+project, builds the `T3Code` Release target for a physical iPhone with Xcode code signing disabled,
+and packages the resulting app as `T3-Code-Preview-V2-unsigned.ipa`.
+
+The workflow copies the repository-root `.env.example`, so the unsigned build gets the same public
+production Clerk and T3 Connect relay identifiers as official source builds. It also enables the
+personal/reduced-capability iOS configuration and verifies that the generated app has no T3 Apple
+team, associated domains, push, app-group, or native Apple Sign-In entitlement.
+
+The IPA itself is intentionally unsigned. Sideloadly, SideStore, AltStore, or another signing tool
+must sign it during installation. No Expo token, EAS project, Apple certificate, or provisioning
+profile is required by the GitHub Actions build.
+
 Android equivalents:
 
 ```bash

@@ -25,6 +25,18 @@
       "environment": "preview",
       "distribution": "internal"
     },
+    "preview:personal": {
+      "corepack": true,
+      "env": {
+        "APP_VARIANT": "preview",
+        "T3CODE_PERSONAL_EAS": "1",
+        "T3CODE_IOS_PERSONAL_TEAM": "1",
+        "NODE_OPTIONS": "--max-old-space-size=4096"
+      },
+      "channel": "preview",
+      "environment": "preview",
+      "distribution": "internal"
+    },
     "preview:dev": {
       "corepack": true,
       "env": {
