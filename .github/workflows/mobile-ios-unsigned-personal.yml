@@ -1,0 +1,218 @@
+name: Personal iOS Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Bundle identifier for the sideloaded preview app
+        required: true
+        default: com.gabew100.t3code.preview
+        type: string
+  push:
+    branches:
+      - personal-ios-v2-latest-20260922
+    paths:
+      - .github/workflows/mobile-ios-unsigned-personal.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ios-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned T3 Code Preview V2 IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      APP_VARIANT: preview
+      EXPO_NO_GIT_STATUS: "1"
+      NODE_OPTIONS: --max-old-space-size=8192
+      T3CODE_IOS_PERSONAL_TEAM: "1"
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id || 'com.gabew100.t3code.preview' }}
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+
+      - name: Expose pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+          "$vp_pnpm_bin/pnpm" --version
+
+      - name: Enable public T3 Connect configuration
+        shell: bash
+        run: cp .env.example .env
+
+      - name: Verify Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Verify personal preview configuration
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec expo config --type public --json > "$RUNNER_TEMP/t3-expo-config.json"
+          node - "$RUNNER_TEMP/t3-expo-config.json" "${T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID}" <<'NODE'
+          const fs = require("node:fs");
+          const [configPath, expectedBundleId] = process.argv.slice(2);
+          const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const failures = [];
+
+          if (config.name !== "T3 Code Preview") failures.push(`name=${config.name}`);
+          if (config.scheme !== "t3code-preview") failures.push(`scheme=${config.scheme}`);
+          if (config.ios?.bundleIdentifier !== expectedBundleId) {
+            failures.push(`bundleIdentifier=${config.ios?.bundleIdentifier}`);
+          }
+          if (config.ios?.appleTeamId) failures.push("appleTeamId is still configured");
+          if ((config.ios?.associatedDomains ?? []).length !== 0) {
+            failures.push("associatedDomains are still configured");
+          }
+          if (config.ios?.entitlements?.["keychain-access-groups"]) {
+            failures.push("explicit keychain access group is still configured");
+          }
+          if (config.updates?.enabled !== false) failures.push("Expo Updates is still enabled");
+          if (config.extra?.iosPersonalTeamBuild !== true) {
+            failures.push("reduced-capability iOS build flag is not enabled");
+          }
+          if (!config.extra?.relay?.url) failures.push("T3 Connect relay URL is missing");
+          if (!config.extra?.clerk?.publishableKey) failures.push("Clerk publishable key is missing");
+          if (!config.extra?.clerk?.jwtTemplate) failures.push("Clerk JWT template is missing");
+
+          if (failures.length > 0) {
+            console.error("Personal preview config validation failed:");
+            for (const failure of failures) console.error(`- ${failure}`);
+            process.exit(1);
+          }
+
+          console.log(`Validated personal V2 preview config for ${expectedBundleId}.`);
+          NODE
+
+      - name: Generate iOS project
+        working-directory: apps/mobile
+        shell: bash
+        run: pnpm exec expo prebuild --clean --platform ios
+
+      - name: Verify reduced iOS entitlements
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          entitlements="$(find ios -maxdepth 2 -name '*.entitlements' | head -1)"
+          if [[ -z "$entitlements" ]]; then
+            echo "No main-app entitlements file was generated."
+            exit 0
+          fi
+
+          plutil -p "$entitlements"
+          if grep -Eq 'aps-environment|application-groups|associated-domains|applesignin|keychain-access-groups' "$entitlements"; then
+            echo "A signing-restricted entitlement survived the personal build configuration." >&2
+            exit 1
+          fi
+
+      - id: build
+        name: Build unsigned device app
+        working-directory: apps/mobile
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+
+          workspace="$(find ios -maxdepth 1 -name '*.xcworkspace' ! -name 'Pods*' | head -1)"
+          if [[ -z "$workspace" ]]; then
+            echo "No generated xcworkspace found under ios/." >&2
+            exit 1
+          fi
+          scheme="$(basename "$workspace" .xcworkspace)"
+          echo "Building workspace '$workspace' with scheme '$scheme'"
+
+          derived_data="$RUNNER_TEMP/t3-ios-derived-data"
+          xcodebuild \
+            -workspace "$workspace" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build
+
+          app_path="$derived_data/Build/Products/Release-iphoneos/$scheme.app"
+          if [[ ! -d "$app_path" ]]; then
+            echo "Expected app bundle was not produced at $app_path" >&2
+            find "$derived_data/Build/Products" -maxdepth 3 -name '*.app' -print || true
+            exit 1
+          fi
+
+          actual_bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app_path/Info.plist")"
+          if [[ "$actual_bundle_id" != "$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID" ]]; then
+            echo "Built bundle ID '$actual_bundle_id' does not match '$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID'." >&2
+            exit 1
+          fi
+
+          if codesign -dv "$app_path" >/dev/null 2>&1; then
+            echo "The app unexpectedly contains a code signature; refusing to label it unsigned." >&2
+            exit 1
+          fi
+
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+
+      - id: package
+        name: Package unsigned IPA
+        working-directory: apps/mobile
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.build.outputs.app_path }}
+        run: |
+          set -euo pipefail
+
+          output_dir="$GITHUB_WORKSPACE/artifacts/ios"
+          package_root="$RUNNER_TEMP/t3-unsigned-ipa"
+          payload_dir="$package_root/Payload"
+          ipa_path="$output_dir/T3-Code-Preview-V2-unsigned.ipa"
+
+          rm -rf "$package_root"
+          mkdir -p "$output_dir" "$payload_dir"
+          ditto "$APP_PATH" "$payload_dir/$(basename "$APP_PATH")"
+          (
+            cd "$package_root"
+            ditto -c -k --sequesterRsrc --keepParent Payload "$ipa_path"
+          )
+
+          unzip -t "$ipa_path"
+          echo "ipa_path=$ipa_path" >> "$GITHUB_OUTPUT"
+          echo "Built unsigned IPA: $ipa_path"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: T3-Code-Preview-V2-unsigned
+          path: ${{ steps.package.outputs.ipa_path }}
+          if-no-files-found: error
+          retention-days: 14
