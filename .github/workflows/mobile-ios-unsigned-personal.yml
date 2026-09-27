@@ -165,7 +165,7 @@ jobs:
           actual_bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app_path/Info.plist")"
           test "$actual_bundle_id" = "$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID"
           executable="$(plutil -extract CFBundleExecutable raw -o - "$app_path/Info.plist")"
-          lipo -verify_arch arm64 "$app_path/$executable"
+          lipo "$app_path/$executable" -verify_arch arm64
           if codesign -dv "$app_path" >/dev/null 2>&1; then
             echo "The app unexpectedly contains a code signature." >&2
             exit 1
