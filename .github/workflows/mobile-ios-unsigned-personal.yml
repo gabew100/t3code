@@ -1,0 +1,230 @@
+name: Personal iOS Unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Bundle identifier for the sideloaded preview app
+        required: true
+        default: com.gabew100.t3code.preview
+        type: string
+  push:
+    branches:
+      - personal-ios-v2-latest-20260927
+    paths:
+      - .github/workflows/mobile-ios-unsigned-personal.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-ios-unsigned-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned T3 Code Preview V2 IPA
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      APP_VARIANT: preview
+      EXPO_NO_GIT_STATUS: "1"
+      NODE_OPTIONS: --max-old-space-size=8192
+      T3CODE_IOS_PERSONAL_TEAM: "1"
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id || 'com.gabew100.t3code.preview' }}
+      T3CODE_MOBILE_UPDATES_ENABLED: "0"
+      T3_SOURCE_SHA: b22246417a5c1c1d27f88f758fcfc526f3865d1c
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Apply proven personal signing configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reuse the exact two sideload compatibility patches from the previous build.
+          # The rest of the app stays on the source commit recorded above.
+          git fetch --no-tags --depth=2 origin \
+            a178b201954dac48663a8940f037d5a60d3116e3 \
+            74dbda470e69a6d97e47573c6a5700959384573c
+          git diff a178b201954dac48663a8940f037d5a60d3116e3^ a178b201954dac48663a8940f037d5a60d3116e3 -- apps/mobile/app.config.ts > "$RUNNER_TEMP/personal-config.patch"
+          git diff 74dbda470e69a6d97e47573c6a5700959384573c^ 74dbda470e69a6d97e47573c6a5700959384573c -- apps/mobile/plugins/withoutIosPersonalTeamCapabilities.cjs > "$RUNNER_TEMP/personal-entitlements.patch"
+          test -s "$RUNNER_TEMP/personal-config.patch"
+          test -s "$RUNNER_TEMP/personal-entitlements.patch"
+          git apply --check "$RUNNER_TEMP/personal-config.patch" "$RUNNER_TEMP/personal-entitlements.patch"
+          git apply "$RUNNER_TEMP/personal-config.patch" "$RUNNER_TEMP/personal-entitlements.patch"
+          git diff --check
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: |
+            args:
+              - --filter=@t3tools/mobile...
+
+      - name: Expose pnpm
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm_version="$(node --print "require('./package.json').packageManager.split('@').pop()")"
+          vp_pnpm_bin="$HOME/.vite-plus/package_manager/pnpm/$pnpm_version/pnpm/bin"
+          echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
+          "$vp_pnpm_bin/pnpm" --version
+
+      - name: Enable public T3 Connect configuration
+        shell: bash
+        run: cp .env.example .env
+
+      - name: Verify Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Verify personal preview configuration
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm exec expo config --type public --json > "$RUNNER_TEMP/t3-expo-config.json"
+          node - "$RUNNER_TEMP/t3-expo-config.json" "$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID" <<'NODE'
+          const fs = require("node:fs");
+          const [configPath, expectedBundleId] = process.argv.slice(2);
+          const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+          const failures = [];
+          if (config.name !== "T3 Code Preview") failures.push(`name=${config.name}`);
+          if (config.scheme !== "t3code-preview") failures.push(`scheme=${config.scheme}`);
+          if (config.ios?.bundleIdentifier !== expectedBundleId) failures.push("Unexpected bundle identifier");
+          if (config.ios?.appleTeamId) failures.push("Apple team is still configured");
+          if ((config.ios?.associatedDomains ?? []).length) failures.push("Associated domains remain");
+          if (config.ios?.entitlements?.["keychain-access-groups"]) failures.push("Explicit keychain group remains");
+          if (config.updates?.enabled !== false) failures.push("OTA updates are enabled");
+          if (config.extra?.iosPersonalTeamBuild !== true) failures.push("Personal build mode is not enabled");
+          if (!config.extra?.relay?.url) failures.push("T3 Connect relay URL is missing");
+          if (!config.extra?.clerk?.publishableKey) failures.push("Clerk publishable key is missing");
+          if (!config.extra?.clerk?.jwtTemplate) failures.push("Clerk JWT template is missing");
+          if (failures.length) throw new Error(failures.join("\n"));
+          console.log(`Validated ${config.name} ${config.version} (${expectedBundleId}).`);
+          NODE
+
+      - name: Generate iOS project
+        working-directory: apps/mobile
+        shell: bash
+        run: pnpm exec expo prebuild --clean --platform ios
+
+      - name: Verify reduced iOS entitlements
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, plistlib
+          forbidden = {"aps-environment", "com.apple.security.application-groups", "com.apple.developer.associated-domains", "com.apple.developer.applesignin", "keychain-access-groups"}
+          for path in pathlib.Path("ios").glob("*/*.entitlements"):
+              with path.open("rb") as stream:
+                  entitlements = plistlib.load(stream)
+              unexpected = forbidden.intersection(entitlements)
+              if unexpected:
+                  raise SystemExit(f"Unsupported entitlements in {path}: {sorted(unexpected)}")
+              print(f"Validated entitlements: {path}")
+          PY
+
+      - id: build
+        name: Build unsigned device app
+        working-directory: apps/mobile
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: |
+          set -euo pipefail
+          workspace="$(find ios -maxdepth 1 -name '*.xcworkspace' ! -name 'Pods*' | head -1)"
+          test -n "$workspace"
+          scheme="$(basename "$workspace" .xcworkspace)"
+          derived_data="$RUNNER_TEMP/t3-ios-derived-data"
+          xcodebuild -quiet \
+            -workspace "$workspace" \
+            -scheme "$scheme" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$derived_data" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            DEVELOPMENT_TEAM= \
+            build 2>&1 | tee "$RUNNER_TEMP/t3-xcodebuild.log"
+          app_path="$derived_data/Build/Products/Release-iphoneos/$scheme.app"
+          test -d "$app_path"
+          actual_bundle_id="$(plutil -extract CFBundleIdentifier raw -o - "$app_path/Info.plist")"
+          test "$actual_bundle_id" = "$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID"
+          executable="$(plutil -extract CFBundleExecutable raw -o - "$app_path/Info.plist")"
+          lipo -verify_arch arm64 "$app_path/$executable"
+          if codesign -dv "$app_path" >/dev/null 2>&1; then
+            echo "The app unexpectedly contains a code signature." >&2
+            exit 1
+          fi
+          if find "$app_path" -name '*.appex' -print | grep -q .; then
+            echo "An extension survived the reduced-capability build." >&2
+            exit 1
+          fi
+          plutil -insert T3SourceCommit -string "$T3_SOURCE_SHA" "$app_path/Info.plist"
+          plutil -insert T3BuildCommit -string "$GITHUB_SHA" "$app_path/Info.plist"
+          plutil -insert T3BuildRun -string "$GITHUB_RUN_ID" "$app_path/Info.plist"
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+          echo "Device app compiled and validated."
+
+      - id: package
+        name: Package and verify unsigned IPA
+        shell: bash
+        env:
+          APP_PATH: ${{ steps.build.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          output_dir="$GITHUB_WORKSPACE/artifacts/ios"
+          package_root="$RUNNER_TEMP/t3-unsigned-ipa"
+          payload_dir="$package_root/Payload"
+          version="$(plutil -extract CFBundleShortVersionString raw -o - "$APP_PATH/Info.plist")"
+          ipa_path="$output_dir/T3-Code-Preview-V2-${version}-${T3_SOURCE_SHA:0:7}-unsigned.ipa"
+          mkdir -p "$output_dir" "$payload_dir"
+          ditto "$APP_PATH" "$payload_dir/$(basename "$APP_PATH")"
+          (cd "$package_root" && ditto -c -k --sequesterRsrc --keepParent Payload "$ipa_path")
+          unzip -tq "$ipa_path"
+          (cd "$output_dir" && shasum -a 256 *.ipa > SHA256SUMS.txt)
+          export IPA_PATH="$ipa_path"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, plistlib
+          ipa = pathlib.Path(os.environ["IPA_PATH"])
+          with (pathlib.Path(os.environ["APP_PATH"]) / "Info.plist").open("rb") as stream:
+              info = plistlib.load(stream)
+          metadata = {"app": info.get("CFBundleDisplayName"), "version": info["CFBundleShortVersionString"], "bundle_id": info["CFBundleIdentifier"], "source_commit": os.environ["T3_SOURCE_SHA"], "build_commit": os.environ["GITHUB_SHA"], "workflow_run": os.environ["GITHUB_RUN_ID"], "unsigned": True, "ota_updates": False, "live_activities": False, "sha256": hashlib.sha256(ipa.read_bytes()).hexdigest(), "size_bytes": ipa.stat().st_size}
+          (ipa.parent / "build-info.json").write_text(json.dumps(metadata, indent=2) + "\n")
+          print(json.dumps(metadata, indent=2))
+          PY
+          echo "ipa_path=$ipa_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: T3-Code-Preview-V2-unsigned-20260927
+          path: artifacts/ios/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: T3-iOS-build-diagnostics-20260927
+          path: |
+            ${{ runner.temp }}/t3-xcodebuild.log
+            ${{ runner.temp }}/t3-expo-config.json
+          if-no-files-found: ignore
+          retention-days: 7
